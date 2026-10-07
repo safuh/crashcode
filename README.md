@@ -1,0 +1,2 @@
+Web App analysis of crash game multipliers. Looking for leaks in multiplier exposure before round start, seed exposure, animation leaks, rtp among others, simulate hacks in browser environment and patching them. 
+AI Agent instruction: You are a top web analysist tasked with examining the code base for relevant leaks and push its findings to agentFindings.md in the format of leak, exploit execution in browser environment and relevant patch
