@@ -241,3 +241,294 @@ A remediation is considered complete when:
 6. Untrusted strings are rendered as text rather than HTML.
 7. Client-persisted state cannot authorize or bypass server-side transaction rules.
 8. Regression tests demonstrate rejection of malformed/untrusted inputs.
+
+
+---
+
+# Game-State / Information-Disclosure Audit
+
+> Scope: defensive review of the game-data boundary. The objective is to ensure that the browser receives only information it is authorized to know at that point in the round. This section deliberately does not document procedures for extracting a hidden result, predicting a future round, or gaining a wagering advantage.
+
+## 8. High — SignalR exposes a broad game-control and game-data surface
+
+**Observed flow**
+
+The generated SignalR hub proxy at `eu-server/signalr/hubs` exposes these server methods:
+
+- `CreateLoadTimeGameInfo`
+- `GetBoardInfo`
+- `GetList`
+- `GetPlayerInfo`
+- `Post`
+- `PostBet`
+- `Cashout`
+- `CashoutMany`
+- `TimerPing`
+
+The page bootstraps the connection and supplies a connection query string containing a token and a game group. This makes the SignalR boundary the primary contract to audit for confidentiality and authorization.
+
+**Leak / risk**
+
+A game-data endpoint can become an information-disclosure boundary if its response contains values that are not yet public, including:
+
+- server seed or seed-derived material before the intended disclosure point;
+- client seed / nonce state that materially reduces uncertainty about a future result;
+- a precomputed crash/result value before the round is terminal;
+- internal RNG state or deterministic inputs;
+- RTP/house-edge configuration that is not intended for the client;
+- future-round metadata;
+- privileged player/account state not required by the current UI.
+
+The hub method names alone do not prove that any of these values are leaked. The server-side implementations must be inspected and their response schemas classified.
+
+**Safe verification**
+
+For every hub method, record:
+
+1. authentication state required;
+2. authorization decision;
+3. request parameters;
+4. response schema;
+5. whether each field is public, player-private, operator-private, or future-round/secret;
+6. the earliest timestamp at which each field is legitimately disclosed.
+
+Automated contract tests should fail if secret/future-round fields appear in a response before their disclosure phase.
+
+**Relevant patch**
+
+- Define explicit DTOs for each hub method rather than returning internal/domain objects.
+- Maintain an allowlist of fields permitted on the browser boundary.
+- Keep RNG seeds, nonces, internal RNG state, and unrevealed result material server-side.
+- Authorize every player-specific method against the authenticated session.
+- Reject requests whose token/session does not map to the requested player.
+- Add response-schema regression tests for every hub method.
+
+---
+
+## 9. High — Round result, hash, and history UI create a result-disclosure boundary
+
+**Observed flow**
+
+`Board.aspx` contains a game-history modal with fields for:
+
+- multiplier;
+- win amount;
+- hash;
+- result.
+
+The page therefore has a deliberate client-side path for displaying result-verification/history information.
+
+**Leak / risk**
+
+The security boundary is not merely whether a result is displayed. The important invariant is:
+
+> A value representing the current or future terminal result must not reach browser state before the product's intended disclosure point.
+
+A result can leak through DOM state, JavaScript objects, serialized bootstrap data, SignalR messages, hidden elements, history payloads, analytics events, or debugging output even when the visible UI does not display it.
+
+**Safe verification**
+
+Use a synthetic test round in a non-production environment and classify all fields delivered before, during, and after the terminal event. Assert that:
+
+- pre-terminal messages contain only state required for rendering the current phase;
+- terminal-result fields first appear at the documented disclosure event;
+- historical records contain only completed rounds;
+- the DOM does not contain hidden future-result fields;
+- global JavaScript objects do not retain unreleased result material.
+
+Do not use the test to predict or act on live results.
+
+**Relevant patch**
+
+- Separate `RoundState` from `RoundResult` DTOs.
+- Emit `RoundResult` only after the authoritative server transition to terminal state.
+- Remove future-result fields from bootstrap payloads.
+- Avoid placing secret/result material in hidden DOM nodes.
+- Clear terminal-result state when a new round begins.
+
+---
+
+## 10. High — Client-visible configuration contains operational game limits
+
+**Observed flow**
+
+`Board.aspx` embeds a `GlobalParameters` JSON object in a hidden input. It currently contains values such as currency, minimum/maximum bet, maximum win, and automatic-cashout limits.
+
+**Leak / risk**
+
+These values are not necessarily secrets, but exposing internal limits creates an information-disclosure surface and can cause the browser to become the apparent authority for transaction constraints.
+
+More importantly, any future addition of RTP, probability, RNG, payout-table, or house-edge parameters to the same client configuration would disclose operator-side game configuration unnecessarily.
+
+**Safe verification**
+
+Maintain a schema test that classifies every client-visible configuration key. A new sensitive key should fail CI unless explicitly approved.
+
+**Relevant patch**
+
+- Keep client configuration limited to presentation and non-sensitive constraints.
+- Enforce all monetary and game rules server-side.
+- Do not ship RNG configuration, probability tables, internal payout logic, or operator-only parameters to the browser.
+- Use separate server-only configuration objects rather than serializing a broad global configuration object.
+
+---
+
+## 11. High — Animation/rendering must not become an oracle for an unreleased result
+
+**Observed flow**
+
+`Board.aspx` loads a client-side rendering stack including PixiJS and game-specific canvas/rendering code. The page also exposes timing-related values such as `currentTime`, `workerTime`, and network-optimization state.
+
+**Leak / risk**
+
+A rendering client can accidentally encode information that is supposed to remain undisclosed. Examples of defensive concerns include:
+
+- an animation path selected from a terminal result before the terminal event;
+- a deterministic animation duration derived directly from an unreleased result;
+- preloaded assets or DOM state that distinguish the future outcome;
+- client timers that expose the terminal timestamp earlier than the authoritative event;
+- interpolation/extrapolation that reconstructs a hidden terminal value.
+
+The presence of animation code does not itself demonstrate a leak; the state-to-animation mapping must be audited.
+
+**Safe verification**
+
+Instrument a sandbox build and record, by round phase:
+
+`server event -> client message -> state transition -> animation parameters -> rendered frame`
+
+Assert that animation parameters available before the terminal event are sufficient only to render the authorized public state and cannot encode the unreleased terminal result.
+
+**Relevant patch**
+
+- Drive animation from authoritative public state, not hidden result data.
+- Do not calculate or transmit future terminal values solely for rendering.
+- Keep the terminal transition server-authoritative.
+- Use server timestamps/sequence numbers for reconciliation rather than exposing hidden outcome timing.
+- Treat all client timing as advisory.
+
+---
+
+## 12. High — SignalR authentication/query-string material should be treated as credential-bearing
+
+**Observed flow**
+
+`Board.aspx` initializes the SignalR connection with a query-string object containing a token and group, and also assigns a token to a global browser variable.
+
+**Leak / risk**
+
+Credential-bearing values in connection URLs and global JavaScript state can be exposed to browser history, network tooling, logs, diagnostics, extensions, screenshots, or unrelated scripts. A token should not be assumed safe merely because the connection is HTTPS.
+
+**Safe verification**
+
+In a non-production environment, verify that:
+
+- credentials are not persisted in ordinary URLs longer than necessary;
+- server logs redact token query parameters;
+- tokens are scoped, short-lived, and revocable;
+- the browser global namespace contains no bearer credential unless strictly required;
+- reconnect flows do not unnecessarily reuse long-lived credentials.
+
+Never use a real player/session token in tests.
+
+**Relevant patch**
+
+- Prefer authenticated cookies or a short-lived connection bootstrap credential.
+- If a query-string token is unavoidable, make it short-lived, scoped, non-reusable, and redacted from logs.
+- Do not duplicate the credential into `window` unless required.
+- Rotate/revoke connection credentials at session termination.
+- Bind the token to the intended user/session and authorization context server-side.
+
+---
+
+## 13. Medium/High — Client-side history and verification data must be treated as untrusted display data
+
+**Leak / risk**
+
+History/result/hash values cross the server-to-browser boundary and are displayed by the client. If the renderer treats these fields as executable markup or trusted structured data, a malformed server-side value or compromised upstream source could cross into the DOM unsafely.
+
+This overlaps with the DOM-XSS finding above but is specifically relevant to game-history/result rendering.
+
+**Safe verification**
+
+Use benign metacharacter test strings in a sandbox fixture and assert that history fields remain text nodes. Validate numeric result fields as numbers and hashes against their expected encoding/length before display.
+
+**Relevant patch**
+
+- Render hash/result/player fields using `textContent` or equivalent safe DOM construction.
+- Validate numeric result fields before formatting.
+- Validate hashes as data, not HTML.
+- Reject unexpected fields from server responses rather than silently rendering them.
+
+---
+
+## 14. Medium — Debug/source-map/global-state disclosure should be part of the game-data audit
+
+**Leak / risk**
+
+Client-side JavaScript, source maps, debug globals, console logging, and hidden DOM state can disclose internal game state even when production API responses are correctly scoped.
+
+The audit should specifically check for:
+
+- source maps shipped to production;
+- development/debug flags;
+- console logging of round state;
+- globally reachable objects containing game state;
+- hidden DOM attributes containing future/result values;
+- serialized bootstrap objects;
+- exception messages containing server-side details.
+
+**Safe verification**
+
+Build a production artifact and enumerate:
+
+1. `window` properties added by the application;
+2. script and source-map URLs;
+3. console output during a complete synthetic round;
+4. hidden inputs/data attributes containing game state;
+5. serialized JSON embedded in HTML.
+
+Flag any secret, future-round, or internal-only field.
+
+**Relevant patch**
+
+- Disable debug logging in production.
+- Do not ship source maps containing sensitive implementation details unless the deployment model explicitly permits them.
+- Keep authoritative game state in scoped application modules rather than `window`.
+- Remove hidden diagnostic fields from production markup.
+- Redact sensitive values from error telemetry.
+
+---
+
+# Game-data acceptance criteria
+
+The game-data boundary is considered hardened when all of the following are true:
+
+1. No browser-visible object contains unreleased seed, nonce, RNG state, or future terminal-result material.
+2. SignalR responses use explicit public DTOs and contain only fields authorized for the current round phase.
+3. Player-specific SignalR methods enforce server-side authentication and authorization.
+4. The terminal result first reaches the client at the documented disclosure event.
+5. History contains only completed-round data.
+6. Animation parameters cannot be used as an oracle for a future result.
+7. RTP, house-edge, probability tables, and internal payout/RNG configuration remain server-side unless deliberately public.
+8. Client configuration is not treated as the authority for bets, cashout, limits, or settlement.
+9. Connection credentials are short-lived/scoped and are not unnecessarily exposed through URLs or global variables.
+10. Production builds contain no unintended debug/source-map/global-state disclosure.
+11. Regression tests cover pre-terminal, terminal, reconnect, history, and malformed-message states.
+12. Any externally hosted game JavaScript is version-pinned or mirrored for auditability; otherwise the repository audit must explicitly record the external dependency as an unverified trust boundary.
+
+## Recommended audit matrix
+
+| Surface | What to classify | Required invariant |
+|---|---|---|
+| SignalR request | token/session/group | authenticated + authorized |
+| SignalR response | fields by round phase | no future/secret data |
+| Bootstrap HTML | hidden inputs/global JSON | no secret/future result |
+| DOM | visible + hidden state | no unreleased result |
+| Animation | frame/timing parameters | no result oracle |
+| History | hash/result/multiplier | completed rounds only |
+| Client config | limits/game parameters | presentation only; server authoritative |
+| Browser globals | game/session objects | minimum necessary state |
+| Source maps/debug | implementation/state | no sensitive production disclosure |
+| Logs/telemetry | tokens/results | redacted/minimized |
+
